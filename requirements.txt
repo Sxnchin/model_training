@@ -8,4 +8,4 @@ seaborn
 scikit-learn
 pandas
 numpy
-opencv-python
+opencv-python-headless
