@@ -3,3 +3,9 @@ torchvision
 Pillow
 timm
 streamlit
+matplotlib
+seaborn
+scikit-learn
+pandas
+numpy
+opencv-python

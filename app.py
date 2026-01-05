@@ -8,8 +8,12 @@ import io
 import numpy as np
 import csv
 import re
+import pandas as pd
 from datetime import datetime
 import os
+
+# Import the analysis module
+from streamlit_analysis import get_analyzer
 
 # Page configuration
 st.set_page_config(
@@ -116,23 +120,13 @@ if 'model' not in st.session_state:
     st.session_state.model_loaded = False
 
 @st.cache_resource
-def load_model():
-    """Load the trained model"""
-    try:
-        DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        MODEL_PATH = "efficientnet_humerus.pt"
-        
-        # Load model architecture (same as train.py)
-        model = timm.create_model("efficientnet_b0", pretrained=False)
-        model.classifier = nn.Linear(model.classifier.in_features, 2)
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-        model.to(DEVICE)
-        model.eval()
-        
-        return model, DEVICE
-    except Exception as e:
-        st.error(f"Error loading model: {str(e)}")
-        return None, None
+def load_analyzer():
+    """Load analyzer with caching"""
+    return get_analyzer()
+
+# Load analyzer
+analyzer = load_analyzer()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def preprocess_image(image):
     """Preprocess image for model prediction"""
@@ -159,16 +153,11 @@ def predict_xray(image, model, device):
             preds = model(x)
             probs = torch.softmax(preds, dim=1)
         
-        normal_prob = probs[0][0].item()
-        osteo_prob = probs[0][1].item()
-        
-        prediction = "Normal" if normal_prob > osteo_prob else "Osteoporotic"
-        confidence = max(normal_prob, osteo_prob)
-        
-        return prediction, normal_prob, osteo_prob, confidence
+        return probs[0].cpu().numpy()
+    
     except Exception as e:
         st.error(f"Error during prediction: {str(e)}")
-        return None, None, None, None
+        return None
 
 
 # ------------------------ Severity scoring & CSV helpers ------------------------
@@ -186,24 +175,19 @@ def compute_severity(model_prob_osteo, failure_load_n, prop_speed_mm_s,
 
 def bone_message(severity, failure_load_n, prop_speed_mm_s):
     if severity < 0.30:
-        category = "Normal"
-        msg = "No significant weakening detected. Maintain healthy bone habits."
+        category = "✅ Healthy Bone"
+        message = f"Strong bone structure detected. Breaking force: {failure_load_n:.0f}N. Low fracture risk."
     elif severity < 0.55:
-        category = "Mild"
-        msg = (f"While not a medical diagnosis, the bone shows mild weakening. "
-               f"Expected fracture force ≈ {failure_load_n:.0f} N. "
-               f"Consult a healthcare provider if symptoms or risk factors exist.")
+        category = "⚠️ Mild Osteoporosis"
+        message = f"Early signs detected. Recommend monitoring. Breaking force: {failure_load_n:.0f}N."
     elif severity < 0.75:
-        category = "Moderate"
-        msg = (f"Bone shows moderate structural weakening. "
-               f"Fracture may occur around {failure_load_n:.0f} N. "
-               f"Propagation speed ({prop_speed_mm_s:.0f} mm/s) suggests reduced toughness.")
+        category = "⚠️⚠️ Moderate Osteoporosis"
+        message = f"Significant bone loss. Consult specialist. Breaking force: {failure_load_n:.0f}N."
     else:
-        category = "Severe"
-        msg = (f"Bone shows **severe** weakening. Expected fracture load ≈ {failure_load_n:.0f} N. "
-               f"Propagation speed ({prop_speed_mm_s:.0f} mm/s) indicates brittle failure. "
-               f"Seek medical evaluation promptly.")
-    return category, msg
+        category = "🚨 Severe Osteoporosis"
+        message = f"Critical condition. Immediate medical attention needed. Breaking force: {failure_load_n:.0f}N."
+    
+    return category, message
 
 
 def _parse_breaking_point_to_newtons(value):
@@ -323,248 +307,293 @@ def parse_csv_file(csv_path: str):
     trials = [r["trial"] for r in rows if r.get("trial") is not None]
     return rows, F_REF, V_REF, V_MAX, trials
 
-# Main app
-def main():
-    # Header
-    st.markdown('<h1 class="main-header">🦴 X-Ray Osteoporosis Analyzer</h1>', unsafe_allow_html=True)
+# ==================== MAIN APP ====================
+
+st.markdown('<h1 class="main-header">🦴 X-Ray Osteoporosis Analyzer</h1>', unsafe_allow_html=True)
+
+# Sidebar
+with st.sidebar:
+    st.markdown("## 📊 Model Information")
+    st.markdown("""
+    - **Architecture:** EfficientNet-B0
+    - **Input Size:** 224×224 pixels
+    - **Classes:** Normal / Osteoporotic
+    - **Training:** 12 epochs with validation split
+    """)
     
-    # Sidebar
-    with st.sidebar:
-        st.header("ℹ️ About")
-        st.markdown("""
-        This AI-powered tool analyzes X-ray images to detect signs of osteoporosis in humerus bones.
-        
-        **How to use:**
-        1. Upload an X-ray image
-        2. Wait for AI analysis
-        3. Review the results
-        
-        **Supported formats:** PNG, JPG, JPEG
-        """)
-        
-        st.header("🔧 Model Info")
-        model, device = load_model()
-        if model is not None:
-            st.success("✅ Model loaded successfully")
-            st.info(f"🖥️ Running on: {device}")
-        else:
-            st.error("❌ Model failed to load")
-            return
-
-        st.header("📄 Mechanical Test Data")
-        st.caption("Using bundled CSV shipped with this app (no upload required).")
-
-        # Defaults
-        default_F_REF, default_V_REF, default_V_MAX = 300.0, 60.0, 500.0
-        failure_load_n = 180.0
-        prop_speed_mm_s = 90.0
-        F_REF, V_REF, V_MAX = default_F_REF, default_V_REF, default_V_MAX
-        selected_trial = None
-
-        # Load internal CSV
-        try:
-            csv_path = os.path.join(os.path.dirname(__file__), "humpty dumpty is humping my leg.csv")
-            rows, F_REF, V_REF, V_MAX, trials = parse_csv_file(csv_path)
-            st.caption(f"Computed references from CSV → F_REF={F_REF:.0f} N, V_REF={V_REF:.0f} mm/s, V_MAX={V_MAX:.0f} mm/s")
-            if trials:
-                selected_trial = st.selectbox("Select Trial", trials)
-                row = next((r for r in rows if r.get("trial") == selected_trial), None)
-                if row:
-                    failure_load_n = row.get("failure_load_n") or F_REF
-                    prop_speed_mm_s = row.get("prop_speed_mm_s") or V_REF
-                    st.caption(
-                        f"Trial {selected_trial} → Breaking Point (raw: {row.get('raw_breaking_point','?')}) ≈ {failure_load_n:.2f} N, "
-                        f"Speed (raw: {row.get('raw_speed','?')}) ≈ {prop_speed_mm_s:.0f} mm/s"
-                    )
-        except Exception as e:
-            st.warning(f"Could not load internal CSV: {e}")
-
-        # Allow manual override or manual entry when no CSV
-        with st.expander("Advanced overrides", expanded=False):
-            failure_load_n = st.number_input("Failure load (N)", min_value=0.0, value=float(failure_load_n), step=10.0)
-            prop_speed_mm_s = st.number_input("Propagation speed (mm/s)", min_value=0.0, value=float(prop_speed_mm_s), step=10.0)
-            F_REF = st.number_input("Reference failure load F_REF (N)", min_value=1.0, value=float(F_REF), step=10.0)
-            V_REF = st.number_input("Reference speed V_REF (mm/s)", min_value=0.0, value=float(V_REF), step=10.0)
-            V_MAX = st.number_input("Max speed V_MAX (mm/s)", min_value=1.0, value=float(V_MAX), step=10.0)
-
-        # Stash in session for use after model prediction
-        st.session_state.mech = dict(
-            failure_load_n=failure_load_n,
-            prop_speed_mm_s=prop_speed_mm_s,
-            F_REF=F_REF,
-            V_REF=V_REF,
-            V_MAX=V_MAX,
-            trial=selected_trial,
-        )
+    st.markdown("## 📝 Instructions")
+    st.markdown("""
+    1. Upload an X-ray image (PNG, JPG, JPEG)
+    2. Click "Analyze X-Ray"
+    3. View prediction results
+    4. Explore detailed visualizations
+    """)
     
-    # Main content
-    col1, col2 = st.columns([1, 1])
+    st.markdown("## ⚠️ Medical Disclaimer")
+    st.warning(
+        "This AI tool is for **educational and research purposes only**. "
+        "It is NOT a replacement for professional medical diagnosis. "
+        "Always consult qualified healthcare professionals."
+    )
+
+# Create tabs for different sections
+tab1, tab2, tab3 = st.tabs(["🔍 Image Analysis", "📊 Model Performance", "📈 Statistical Analysis"])
+
+with tab1:
+    st.markdown("### Upload and Analyze X-Ray Image")
+    
+    col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.header("📤 Upload X-Ray Image")
         uploaded_file = st.file_uploader(
-            "Choose an X-ray image...",
+            "Choose an X-ray image",
             type=['png', 'jpg', 'jpeg'],
-            help="Upload a clear X-ray image of a humerus bone"
+            help="Upload a bone X-ray image in PNG, JPG, or JPEG format"
         )
-        
-        if uploaded_file is not None:
-            # Display uploaded image
-            image = Image.open(uploaded_file)
-            st.image(image, caption="Uploaded X-Ray", use_column_width=True)
-            
-            # Analysis button
-            if st.button("🔍 Analyze X-Ray", type="primary"):
-                with st.spinner("🤖 AI is analyzing your X-ray..."):
-                    prediction, normal_prob, osteo_prob, confidence = predict_xray(image, model, device)
-                
-                if prediction is not None:
-                    # Store results in session state
-                    st.session_state.prediction = prediction
-                    st.session_state.normal_prob = normal_prob
-                    st.session_state.osteo_prob = osteo_prob
-                    st.session_state.confidence = confidence
-                    st.session_state.analysis_time = datetime.now().isoformat(timespec="seconds")
-
-                    # Compute severity based on sidebar values
-                    mech = st.session_state.get("mech", {})
-                    failure_load_n = mech.get("failure_load_n", 180.0)
-                    prop_speed_mm_s = mech.get("prop_speed_mm_s", 90.0)
-                    F_REF = mech.get("F_REF", 300.0)
-                    V_REF = mech.get("V_REF", 60.0)
-                    V_MAX = mech.get("V_MAX", 500.0)
-
-                    severity = compute_severity(osteo_prob, failure_load_n, prop_speed_mm_s, F_REF, V_REF, V_MAX)
-                    category, message = bone_message(severity, failure_load_n, prop_speed_mm_s)
-                    st.session_state.severity = severity
-                    st.session_state.severity_category = category
-                    st.session_state.severity_message = message
     
     with col2:
-        st.header("📊 Analysis Results")
+        analyze_button = st.button("🔍 Analyze X-Ray", use_container_width=True, key="analyze_btn")
+    
+    if uploaded_file is not None:
+        # Display uploaded image
+        image = Image.open(uploaded_file).convert('RGB')
         
-        if hasattr(st.session_state, 'prediction'):
-            prediction = st.session_state.prediction
-            normal_prob = st.session_state.normal_prob
-            osteo_prob = st.session_state.osteo_prob
-            confidence = st.session_state.confidence
+        st.markdown("### Input Image")
+        st.image(image, caption="Uploaded X-Ray Image", use_column_width=True)
+        
+        if analyze_button:
+            with st.spinner("🤖 Analyzing image..."):
+                probs = predict_xray(image, analyzer.model, device)
+                
+                if probs is not None:
+                    normal_prob = probs[0]
+                    osteo_prob = probs[1]
+                    
+                    # Determine prediction
+                    prediction = "Normal" if normal_prob > osteo_prob else "Osteoporotic"
+                    confidence = max(normal_prob, osteo_prob)
+                    
+                    # Store in session for later use
+                    st.session_state.last_prediction = {
+                        'image': image,
+                        'normal_prob': normal_prob,
+                        'osteo_prob': osteo_prob,
+                        'prediction': prediction,
+                        'confidence': confidence
+                    }
+        
+        # Display prediction
+        if 'last_prediction' in st.session_state:
+            st.markdown("### 🎯 Prediction Results")
             
-            # Main prediction card
+            pred_data = st.session_state.last_prediction
+            normal_prob = pred_data['normal_prob']
+            osteo_prob = pred_data['osteo_prob']
+            prediction = pred_data['prediction']
+            confidence = pred_data['confidence']
+            
+            # Prediction card
             card_class = "normal-card" if prediction == "Normal" else "osteoporotic-card"
-            
             st.markdown(f"""
             <div class="prediction-card {card_class}">
-                <div class="prediction-title">
-                    <span class="status-dot {'dot-normal' if prediction=='Normal' else 'dot-osteo'}"></span>
-                    <span class="prediction-text">{prediction}</span>
-                </div>
-                <div class="prediction-meta">Confidence: {confidence:.1%}</div>
-                <div class="prediction-subtle">AI-assisted screening result — not a medical diagnosis.</div>
+                <p class="prediction-title">
+                    <span class="status-dot dot-{'normal' if prediction == 'Normal' else 'osteo'}"></span>
+                    <strong>{prediction}</strong>
+                </p>
+                <p class="prediction-meta">Confidence: <strong>{confidence*100:.1f}%</strong></p>
             </div>
             """, unsafe_allow_html=True)
             
             # Detailed probabilities
-            st.subheader("📈 Detailed Analysis")
+            st.markdown("#### Detailed Probabilities")
+            col1, col2 = st.columns(2)
             
-            # Normal probability
-            st.markdown("**Normal Bone:**")
-            st.progress(normal_prob)
-            st.text(f"{normal_prob:.1%}")
+            with col1:
+                st.metric("Normal Probability", f"{normal_prob*100:.2f}%")
             
-            # Osteoporotic probability
-            st.markdown("**Osteoporotic Bone:**")
-            st.progress(osteo_prob)
-            st.text(f"{osteo_prob:.1%}")
+            with col2:
+                st.metric("Osteoporotic Probability", f"{osteo_prob*100:.2f}%")
             
-            # Severity and recommendation
-            if 'severity' in st.session_state:
-                st.subheader("🦴 Severity & Recommendation")
-                cat = st.session_state.severity_category
-                sev = float(st.session_state.severity)
-                css_class = {
-                    "Normal": "severity-normal",
-                    "Mild": "severity-mild",
-                    "Moderate": "severity-moderate",
-                    "Severe": "severity-severe",
-                }.get(cat, "severity-mild")
-
-                st.markdown(f"""
-                <div class="severity-card {css_class}">
-                    <div class="severity-header">
-                        <div class="severity-chip">{cat}</div>
-                        <div class="severity-score">Severity: {sev:.2f}</div>
-                    </div>
-                    <div class="severity-message">{st.session_state.severity_message}</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # Move technical details into an optional expander (less scary)
-                mech = st.session_state.get("mech", {})
-                with st.expander("Details (technical)"):
-                    st.write(
-                        f"Using F_REF={mech.get('F_REF', 300.0):.0f} N, "
-                        f"V_REF={mech.get('V_REF', 60.0):.0f} mm/s, "
-                        f"V_MAX={mech.get('V_MAX', 500.0):.0f} mm/s; "
-                        f"Trial={mech.get('trial', '—')}"
-                    )
-
-            # Additional information
-            st.subheader("⚕️ Medical Disclaimer")
-            st.warning("""
-            **Important:** This AI tool is for educational and research purposes only. 
-            It should NOT be used as a substitute for professional medical diagnosis. 
-            Always consult with a qualified healthcare provider for medical decisions.
-            """)
+            # ==================== IMAGE-SPECIFIC VISUALIZATIONS ====================
             
-            # Download results
-            if st.button("📥 Download Results"):
-                results_text = f"""
-X-Ray Osteoporosis Analysis Results
-==================================
-
-Prediction: {prediction}
-Confidence: {confidence:.1%}
-
-Detailed Probabilities:
-- Normal: {normal_prob:.4f} ({normal_prob:.1%})
-- Osteoporotic: {osteo_prob:.4f} ({osteo_prob:.1%})
-
- Severity Assessment:
- - Severity score: {st.session_state.get('severity', float('nan')):.2f}
- - Category: {st.session_state.get('severity_category', 'N/A')}
- - Message: {st.session_state.get('severity_message', 'N/A')}
-
- Mechanical Inputs:
- - Failure load (N): {st.session_state.get('mech', {}).get('failure_load_n', 'N/A')}
- - Propagation speed (mm/s): {st.session_state.get('mech', {}).get('prop_speed_mm_s', 'N/A')}
- - F_REF (N): {st.session_state.get('mech', {}).get('F_REF', 'N/A')}
- - V_REF (mm/s): {st.session_state.get('mech', {}).get('V_REF', 'N/A')}
- - V_MAX (mm/s): {st.session_state.get('mech', {}).get('V_MAX', 'N/A')}
-
-Generated by AI X-Ray Analyzer
-Timestamp: {str(st.session_state.get('analysis_time', 'Unknown'))}
-
-MEDICAL DISCLAIMER: This analysis is for educational purposes only 
-and should not replace professional medical diagnosis.
-                """
-                st.download_button(
-                    label="📄 Download as Text",
-                    data=results_text,
-                    file_name=f"xray_analysis_{prediction.lower()}.txt",
-                    mime="text/plain"
-                )
-        else:
-            st.info("👆 Upload an X-ray image and click 'Analyze' to see results here.")
+            st.markdown("---")
+            st.markdown("### 🔥 Advanced Image Analysis")
             
-            # Example images section
-            st.subheader("🖼️ Example Analysis")
-            st.markdown("""
-            **What you'll see after analysis:**
-            - 🎯 Clear prediction (Normal/Osteoporotic)
-            - 📊 Confidence percentages
-            - 📈 Detailed probability breakdown
-            - 📥 Downloadable results
-            """)
+            sub_tab1, sub_tab2, sub_tab3 = st.tabs([
+                "🧠 Grad-CAM Attention",
+                "🎨 Feature Extraction",
+                "📊 Confidence Breakdown"
+            ])
+            
+            with sub_tab1:
+                st.markdown("#### Where the AI Looks in Your Image")
+                st.markdown("""
+                **Grad-CAM (Gradient-weighted Class Activation Mapping)** shows which regions 
+                of the X-ray the AI model focuses on when making predictions.
+                - 🔴 **Red areas** = High attention (important for diagnosis)
+                - 🔵 **Blue areas** = Low attention
+                """)
+                
+                with st.spinner("Generating Grad-CAM..."):
+                    grad_cam_fig = analyzer.grad_cam_single_image(image)
+                    st.pyplot(grad_cam_fig, use_container_width=True)
+            
+            with sub_tab2:
+                st.markdown("#### Feature Extraction Analysis")
+                st.markdown("""
+                Shows low-level features extracted from the X-ray:
+                - **Original** = Input X-ray
+                - **Edge Detection** = Boundary detection (Canny)
+                - **Gradient Magnitude** = Intensity changes (Sobel)
+                - **Contours** = Detected boundaries
+                """)
+                
+                with st.spinner("Extracting features..."):
+                    feature_fig = analyzer.feature_extraction_single_image(image)
+                    st.pyplot(feature_fig, use_container_width=True)
+            
+            with sub_tab3:
+                st.markdown("#### Model Confidence Analysis")
+                st.markdown("Visual breakdown of how confident the model is in its prediction.")
+                
+                with st.spinner("Computing confidence metrics..."):
+                    confidence_fig = analyzer.confidence_breakdown(image)
+                    st.pyplot(confidence_fig, use_container_width=True)
 
-if __name__ == "__main__":
-    main()
+with tab2:
+    st.markdown("### Model Performance Metrics")
+    st.markdown("""
+    These metrics evaluate the model's performance across the entire dataset.
+    They help understand the model's overall reliability and diagnostic accuracy.
+    """)
+    
+    # Create sub-tabs for different metrics
+    perf_tab1, perf_tab2, perf_tab3 = st.tabs([
+        "🎯 Confusion Matrix",
+        "📉 ROC Curve",
+        "📚 Training History"
+    ])
+    
+    with perf_tab1:
+        st.markdown("#### Confusion Matrix")
+        st.markdown("""
+        Shows how often the model correctly/incorrectly classifies samples:
+        - **TP (Top-left)** = Correctly identified Normal
+        - **FP (Top-right)** = Incorrectly labeled as Osteoporotic (False Positive)
+        - **FN (Bottom-left)** = Incorrectly labeled as Normal (False Negative)
+        - **TN (Bottom-right)** = Correctly identified Osteoporotic
+        """)
+        
+        with st.spinner("Generating confusion matrix..."):
+            cm_fig = analyzer.plot_confusion_matrix_fig()
+            st.pyplot(cm_fig, use_container_width=True)
+    
+    with perf_tab2:
+        st.markdown("#### ROC Curve Analysis")
+        st.markdown("""
+        The ROC (Receiver Operating Characteristic) curve shows the trade-off between 
+        True Positive Rate and False Positive Rate.
+        - **AUC = 1.0** = Perfect classifier
+        - **AUC = 0.5** = Random classifier
+        - **AUC > 0.8** = Good classifier
+        """)
+        
+        with st.spinner("Generating ROC curve..."):
+            roc_fig = analyzer.plot_roc_curve_fig()
+            st.pyplot(roc_fig, use_container_width=True)
+    
+    with perf_tab3:
+        st.markdown("#### Training Loss & Accuracy Curves")
+        st.markdown("""
+        Visualizes how the model improved during training:
+        - **Left plot** = Training loss (should decrease)
+        - **Right plot** = Validation accuracy (should increase)
+        """)
+        
+        with st.spinner("Generating loss curves..."):
+            loss_fig = analyzer.plot_loss_curves_fig()
+            st.pyplot(loss_fig, use_container_width=True)
+
+with tab3:
+    st.markdown("### Detailed Statistical Analysis")
+    st.markdown("""
+    Advanced analysis including feature importance, mechanical properties, and network architecture.
+    """)
+    
+    stat_tab1, stat_tab2, stat_tab3, stat_tab4, stat_tab5 = st.tabs([
+        "🎯 Feature Importance",
+        "💪 Breaking Force",
+        "📊 Porosity-Strength",
+        "⚡ Crack Velocity",
+        "🏗️ Architecture"
+    ])
+    
+    with stat_tab1:
+        st.markdown("#### Top Important Features")
+        st.markdown("""
+        The features the model learned to distinguish between Normal and Osteoporotic bones.
+        Taller bars indicate more important features in the CNN.
+        """)
+        
+        with st.spinner("Computing feature importance..."):
+            feat_fig = analyzer.plot_feature_importance_fig()
+            st.pyplot(feat_fig, use_container_width=True)
+    
+    with stat_tab2:
+        st.markdown("#### Breaking Force Analysis")
+        st.markdown("""
+        Shows mechanical properties across different bone types:
+        - **Height** = Average breaking force (Newtons)
+        - **Error bars** = ± Standard deviation
+        - Indicates which bone types are stronger/weaker
+        """)
+        
+        with st.spinner("Analyzing breaking force..."):
+            force_fig = analyzer.plot_breaking_force_fig()
+            st.pyplot(force_fig, use_container_width=True)
+    
+    with stat_tab3:
+        st.markdown("#### Porosity vs Bone Strength Correlation")
+        st.markdown("""
+        Demonstrates the relationship between bone porosity and mechanical strength:
+        - **R² value** indicates correlation strength
+        - **Red line** = Linear regression fit
+        - Strong negative correlation validates the model's logic
+        """)
+        
+        with st.spinner("Computing correlation..."):
+            porosity_fig = analyzer.plot_porosity_strength_fig()
+            st.pyplot(porosity_fig, use_container_width=True)
+    
+    with stat_tab4:
+        st.markdown("#### Crack Propagation Velocity Distribution")
+        st.markdown("""
+        Shows how quickly cracks propagate in different bone types:
+        - **Box plot** = Quartiles and outliers
+        - **Violin plot** = Full probability distribution
+        """)
+        
+        with st.spinner("Analyzing crack velocity..."):
+            velocity_fig = analyzer.plot_crack_velocity_fig()
+            st.pyplot(velocity_fig, use_container_width=True)
+    
+    with stat_tab5:
+        st.markdown("#### Network Architecture")
+        st.markdown("""
+        Visual representation of the EfficientNet-B0 architecture used for classification.
+        Shows how data flows through the network layers.
+        """)
+        
+        with st.spinner("Drawing architecture..."):
+            arch_fig = analyzer.plot_network_architecture_fig()
+            st.pyplot(arch_fig, use_container_width=True)
+
+# ==================== FOOTER ====================
+
+st.markdown("---")
+st.markdown("""
+<div style="text-align: center; opacity: 0.7; font-size: 0.9rem;">
+    <p>🦴 X-Ray Osteoporosis Analyzer | Medical AI | Educational Use Only</p>
+    <p>⚠️ Not a replacement for professional medical diagnosis</p>
+</div>
+""", unsafe_allow_html=True)

@@ -50,6 +50,10 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 print("🚀 Training on:", device)
 print(f"📂 Training images: {train_split}  |  Validation images: {val_split}")
 
+# Track metrics for visualization
+train_losses = []
+val_accs = []
+
 for epoch in range(1, EPOCHS + 1):
     model.train()
     running_loss = 0
@@ -68,6 +72,10 @@ for epoch in range(1, EPOCHS + 1):
         running_loss += loss.item()
         loop.set_postfix(loss=f"{running_loss:.3f}")
 
+    # Store average loss for this epoch
+    avg_loss = running_loss / len(train_loader)
+    train_losses.append(avg_loss)
+
     # Validation
     model.eval()
     correct, total = 0, 0
@@ -83,5 +91,17 @@ for epoch in range(1, EPOCHS + 1):
     acc = correct / total
     print(f"✅ Epoch {epoch} complete | Val Accuracy: {acc:.3f}")
 
+    val_accs.append(acc)
+
 torch.save(model.state_dict(), MODEL_OUT)
 print(f"🎉 Model saved → {MODEL_OUT}")
+
+# Save training history
+import json
+history = {
+    "train_losses": train_losses,
+    "val_accs": val_accs,
+}
+with open("training_history.json", "w") as f:
+    json.dump(history, f)
+print("📊 Training history saved → training_history.json")
